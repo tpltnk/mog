@@ -1,15 +1,26 @@
 package main
 
 import (
-	"fmt"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
 //go:generate stringer -type=TokenType
 type TokenType int
 
+func (tt TokenType) isExprStart() bool {
+	_, okPrefix := prefixOps[tt]
+	_, okLits := lits[tt]
+	_, okGroup := groupOps[tt]
+	return okPrefix || okLits || okGroup
+}
+
 const (
 	TT_IDENT TokenType = iota
+	TT_BYTE
 	TT_STRING
 	TT_INT
 	TT_FLOAT
@@ -199,12 +210,67 @@ var (
 		TT_DOT:     28,
 		TT_COLON:   30,
 	}
+	lits = map[TokenType]bool{
+		TT_STRING: true,
+		TT_INT:    true,
+		TT_BYTE:   true,
+		TT_LBRACE: true, // aka block
+		TT_IDENT:  true,
+		TT_FLOAT:  true,
+	}
 )
 
 type Token struct {
-	tt    TokenType
-	start int
-	end   int
+	tt  TokenType
+	pos PositionVector
+}
+
+type SourceManager struct {
+	parsers map[string]Parser
+}
+
+func NewSourceManager(lenHint int) SourceManager {
+	return SourceManager{
+		parsers: make(map[string]Parser, lenHint),
+	}
+}
+
+func (sm *SourceManager) AddSource(srcName string, src string) error {
+	if _, exists := sm.parsers[srcName]; exists {
+		return errors.New("source with specified name already exists")
+	}
+	sm.parsers[srcName] = NewParser(src)
+	return nil
+}
+
+func (sm *SourceManager) AddFile(path string) error {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return sm.AddSource(path, string(content))
+}
+
+func (sm *SourceManager) AddDir(path string) error {
+	return filepath.WalkDir(path, func(path string, dirEntry fs.DirEntry, err error) error {
+		if dirEntry.Type().IsRegular() && filepath.Ext(dirEntry.Name()) == ".mog" {
+			if err := sm.AddFile(path); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (sm *SourceManager) ParseSources() map[string]*Block {
+	roots := make(map[string]*Block, len(sm.parsers))
+	for srcName, parser := range sm.parsers {
+		if _, exists := roots[srcName]; exists {
+			panic("src with that name already exists")
+		}
+		roots[srcName] = parser.NextRoot()
+	}
+	return roots
 }
 
 type Parser struct {
@@ -217,42 +283,61 @@ type Parser struct {
 	currTok Token
 	nextTok Token
 
-	currBlk *Block
+	currBlk  *Block
+	blkDepth int
 }
 
 func NewParser(src string) Parser {
 	p := Parser{
-		src:  src,
-		pos:  0,
-		col:  1,
-		line: 1,
+		src:      src,
+		pos:      0,
+		col:      1,
+		line:     1,
+		blkDepth: 0,
 	}
 	p.advance()
 	return p
 }
 
-func (p *Parser) nextBlock() *Block {
+func (p *Parser) NextRoot() *Block {
+	root := p.NextBlock()
+	if root.parent != nil {
+		panic("improper nesting detected")
+	}
+	return root
+}
+
+func (p *Parser) NextBlock() *Block {
+	p.blkDepth++
+	if p.blkDepth > 32 {
+		panic("max block depth exceeded")
+	}
 	p.currBlk = &Block{
-		stmts:  make([]Stmt, 0),
+		pos: PositionVector{
+			start: p.currTok.pos.start,
+		},
+		stmts:  make([]Statement, 0),
 		parent: p.currBlk,
 	}
 	for {
-		stmt := p.nextStmt()
+		stmt := p.nextStatement()
 		if stmt == nil {
 			break
 		}
 		p.currBlk.stmts = append(p.currBlk.stmts, stmt)
 	}
+	p.currBlk.pos.end = p.currTok.pos.end
 	blk := p.currBlk
 	p.currBlk = p.currBlk.parent
+	p.blkDepth--
 	return blk
 }
 
-func (p *Parser) nextStmt() Stmt {
-	if p.nextTok.tt == TT_EOF {
+func (p *Parser) nextStatement() Statement {
+	p.advance()
+	if p.currTok.tt == TT_EOF {
 		return nil
 	}
-	p.advance()
 	switch p.currTok.tt {
 	case TT_RBRACE:
 		return nil
@@ -261,7 +346,7 @@ func (p *Parser) nextStmt() Stmt {
 	case TT_KW_BREAK:
 		return p.nextBreak()
 	case TT_KW_CONTINUE:
-		return p.nextBreak()
+		return p.nextContinue()
 	case TT_KW_YIELD:
 		return p.nextYield()
 	case TT_KW_ASSERT:
@@ -273,7 +358,7 @@ func (p *Parser) nextStmt() Stmt {
 	case TT_KW_FOR:
 		return p.nextFor()
 	case TT_KW_FUN:
-		return p.nextFun()
+		return p.nextFunction()
 	case TT_KW_CLASS:
 		return p.nextClass()
 	case TT_EOF:
@@ -283,52 +368,81 @@ func (p *Parser) nextStmt() Stmt {
 	}
 }
 
-func (p *Parser) nextReturn() Stmt {
-	p.advance()
+func (p *Parser) nextReturn() Statement {
+	start := p.currTok.pos.start
+	end := p.currTok.pos.end
+	if p.nextTok.tt.isExprStart() {
+		p.advance()
+	}
 	rhs := p.nextExpr(0)
-	return Return{rhs}
+	if rhs != nil {
+		end = rhs.end()
+	}
+	return Return{PositionVector{start, end}, rhs}
 }
 
-func (p *Parser) nextBreak() Stmt {
-	p.advance()
+func (p *Parser) nextBreak() Statement {
+	start := p.currTok.pos.start
+	end := p.currTok.pos.end
+	if p.nextTok.tt.isExprStart() {
+		p.advance()
+	}
 	rhs := p.nextExpr(0)
-	return Break{rhs}
+	if rhs != nil {
+		end = rhs.end()
+	}
+	return Break{PositionVector{start, end}, rhs}
 }
 
-func (p *Parser) nextContinue() Stmt {
-	p.advance()
-	return Continue{}
+func (p *Parser) nextContinue() Statement {
+	start := p.currTok.pos.start
+	end := p.currTok.pos.end
+	return Continue{PositionVector{start, end}}
 }
 
-func (p *Parser) nextYield() Stmt {
-	p.advance()
+func (p *Parser) nextYield() Statement {
+	start := p.currTok.pos.start
+	end := p.currTok.pos.end
+	if p.nextTok.tt.isExprStart() {
+		p.advance()
+	}
 	rhs := p.nextExpr(0)
-	return Yield{rhs}
+	if rhs != nil {
+		end = rhs.end()
+	}
+	return Yield{PositionVector{start, end}, rhs}
 }
 
-func (p *Parser) nextAssert() Stmt {
+func (p *Parser) nextAssert() Statement {
+	start := p.currTok.pos.start
 	p.advance()
 	rhs := p.nextExpr(0)
-	return Assert{rhs}
+	if rhs == nil {
+		panic("empty assert not allowed")
+	}
+	return Assert{PositionVector{start, rhs.end()}, rhs}
 }
 
-func (p *Parser) nextImport() Stmt {
+func (p *Parser) nextImport() Statement {
+	start := p.currTok.pos.start
 	p.advance()
 	rhs := p.nextExpr(0)
-	return Import{rhs}
+	if rhs == nil {
+		panic("empty import not allowed")
+	}
+	return Import{PositionVector{start, rhs.end()}, rhs}
 }
 
 func (p *Parser) nextClass() Class {
+	start := p.currTok.pos.start
 	p.advance()
-	name := Ident{}
+	name := Identifier{p.currTok}
 	p.advance()
-	p.advance()
-	params := make([]Param, 0)
+	params := make([]Parameter, 0)
 	for {
-		if p.nextTok.tt == TT_EOF {
-			break
-		}
 		switch p.nextTok.tt {
+		case TT_EOF:
+			goto out
 		case TT_COMMA:
 			p.advance()
 			continue
@@ -337,42 +451,43 @@ func (p *Parser) nextClass() Class {
 			goto out
 		case TT_IDENT:
 			p.advance()
-			params = append(params, p.nextParam())
+			params = append(params, p.nextParameter())
 			continue
 		default:
 			goto out
 		}
 	}
 out:
-	return Class{name, params}
+	return Class{PositionVector{start, p.pos}, name, params}
 }
 
-func (p *Parser) nextIf() Expr {
+func (p *Parser) nextIf() Statement {
+	start := p.pos
 	p.advance()
 	cond := p.nextExpr(0)
 	if cond == nil {
 		panic("condition must be set")
 	}
 	p.advance()
-	main := p.nextBlock()
+	main := p.NextBlock()
 	var alt *Block
 	if p.nextTok.tt == TT_KW_ELSE {
 		p.advance() // else
 		p.advance() // {
-		alt = p.nextBlock()
+		alt = p.NextBlock()
 	}
-	return If{cond, main, alt}
+	return If{PositionVector{start, p.pos}, cond, main, alt}
 }
 
-func (p *Parser) nextFor() Stmt {
+func (p *Parser) nextFor() Statement {
+	start := p.currTok.pos.start
 	p.advance()
-	var ident *Ident
-	var ty *Ty
+	var spec *Specification
 	if p.currTok.tt != TT_LBRACE {
-		ident, ty = p.nextIdentTy()
+		spec = p.nextSpecification()
 	}
 	var src Expr
-	if ident != nil && ty != nil {
+	if spec != nil {
 		if p.currTok.tt != TT_KW_IN {
 			panic("missing 'in' keyword")
 		}
@@ -383,33 +498,47 @@ func (p *Parser) nextFor() Stmt {
 		}
 		p.advance()
 	}
-	body := p.nextBlock()
-	return For{ident, ty, src, body}
+	body := p.NextBlock()
+	return For{PositionVector{start, p.currTok.pos.end}, spec, src, body}
 }
 
-func (p *Parser) nextFun() Fun {
-	var ident Ident
-	if p.nextTok.tt == TT_IDENT {
-		p.advance()
-		ident = Ident{}
-	}
+func (p *Parser) nextFunction() Function {
+	start := p.currTok.pos.start
 	p.advance()
 	sig := p.nextSignature()
 	p.advance()
-	body := p.nextBlock()
-	return Fun{ident, sig, body}
+	body := p.NextBlock()
+	return Function{PositionVector{start, p.pos}, sig, body}
 }
 
 func (p *Parser) nextSignature() Signature {
+	start := p.currTok.pos.start
+	var ident *Identifier
+	var classIdent *Identifier
+	if p.currTok.tt == TT_IDENT {
+		ident = &Identifier{p.currTok}
+		p.advance()
+	}
+	if p.currTok.tt == TT_DOT {
+		if ident == nil {
+			panic("class name missing before .")
+		}
+		classIdent = ident
+		p.advance()
+		if p.currTok.tt != TT_IDENT {
+			panic("expected ident")
+		}
+		ident = &Identifier{p.currTok}
+		p.advance()
+	}
 	if p.currTok.tt != TT_LPAREN {
 		panic("signature must start with (")
 	}
-	params := make([]Param, 0)
+	params := make([]Parameter, 0)
 	for {
-		if p.nextTok.tt == TT_EOF {
-			break
-		}
 		switch p.nextTok.tt {
+		case TT_EOF:
+			goto out
 		case TT_COMMA:
 			p.advance()
 			continue
@@ -418,7 +547,7 @@ func (p *Parser) nextSignature() Signature {
 			goto out
 		case TT_IDENT:
 			p.advance()
-			params = append(params, p.nextParam())
+			params = append(params, p.nextParameter())
 			continue
 		default:
 			goto out
@@ -428,50 +557,62 @@ out:
 	if p.currTok.tt != TT_RPAREN {
 		panic("signature ended improperly")
 	}
-	var returnTy Ty
+	var returnTy Type
 	if p.nextTok.tt == TT_COLON {
 		p.advance()
 		p.advance()
-		returnTy = p.nextTy()
+		returnTy = p.nextType()
 	}
-	return Signature{params, returnTy}
+	return Signature{PositionVector{start, p.currTok.pos.end}, classIdent, ident, params, returnTy}
 }
 
-func (p *Parser) nextParam() Param {
-	ident, ty := p.nextIdentTy()
+func (p *Parser) nextParameter() Parameter {
+	spec := p.nextSpecification()
 	var dfl Expr
 	if p.nextTok.tt == TT_IS {
 		p.advance()
 		p.advance()
 		dfl = p.nextExpr(0)
 	}
-	return Param{ident, ty, dfl}
+	return Parameter{*spec, dfl}
 }
 
-func (p *Parser) nextTy() Ty {
+// TODO: "Lift" (provide a different set of ops) for parsing complicated Type (by LL(1) Pratt logic)
+// TODO: probably with a stack: stack.push(new_ops) and parse according to stack[last] then stack.pop() on signal/ctx_switch message
+// Consideration: How much semantics is good in Type(s)?
+func (p *Parser) nextType() Type {
 	switch p.currTok.tt {
 	case TT_IDENT:
-		return Type{}
+		return IdentType{p.currTok}
 	case TT_STAR:
+		start := p.pos
 		p.advance()
-		return Pointer{
-			inner: p.nextTy(),
+		inner := p.nextType()
+		return PointerType{
+			PositionVector{
+				start,
+				inner.end(),
+			},
+			inner,
 		}
 	default:
 		return nil
 	}
 }
 
-func (p *Parser) nextIdentTy() (*Ident, *Ty) {
-	ident := Ident{}
+func (p *Parser) nextSpecification() *Specification {
+	ident := Identifier{p.currTok}
 	p.advance()
 	if p.currTok.tt != TT_COLON {
 		panic("ident ty must be separated by colon")
 	}
 	p.advance()
-	ty := p.nextTy()
+	ty := p.nextType()
 	p.advance()
-	return &ident, &ty
+	return &Specification{
+		ident,
+		ty,
+	}
 }
 
 func (p *Parser) nextExpr(minBindPower int) Expr {
@@ -508,26 +649,22 @@ func (p *Parser) nextExpr(minBindPower int) Expr {
 }
 
 func (p *Parser) nextPrefix() Expr {
-	for k := range prefixOps {
-		if p.currTok.tt == k {
-			currTok := p.currTok
-			rightBindPower := prefixBindPowers[p.currTok.tt]
-			p.advance()
-			rhs := p.nextExpr(rightBindPower)
-			return Prefix{currTok.tt, rhs}
-		}
+	if _, ok := prefixOps[p.currTok.tt]; ok {
+		currTok := p.currTok
+		rightBindPower := prefixBindPowers[p.currTok.tt]
+		p.advance()
+		rhs := p.nextExpr(rightBindPower)
+		return Prefix{currTok, rhs}
 	}
-	for k, _ := range groupOps {
-		if p.currTok.tt == k {
+	if _, ok := groupOps[p.currTok.tt]; ok {
+		p.advance()
+		inner := p.nextExpr(0)
+		if inner == nil {
+			inner = Unit{}
+		} else {
 			p.advance()
-			inner := p.nextExpr(0)
-			if inner == nil {
-				return Null{}
-			} else {
-				p.advance()
-			}
-			return inner
 		}
+		return inner
 	}
 	return p.nextLit()
 }
@@ -535,27 +672,23 @@ func (p *Parser) nextPrefix() Expr {
 func (p *Parser) nextInfix(lhs Expr, rightBindPower int, opTok Token) Infix {
 	p.advance()
 	rhs := p.nextExpr(rightBindPower)
-	return Infix{lhs, opTok.tt, rhs}
+	return Infix{PositionVector{lhs.start(), rhs.end()}, lhs, opTok, rhs}
 }
 
 func (p *Parser) nextSuffix(lhs Expr, opTok Token) Expr {
-	for k, _ := range suffixClosedOps {
-		if opTok.tt == k {
+	if v, ok := suffixClosedOps[opTok.tt]; ok {
+		p.advance()
+		rhs := p.nextExpr(0)
+		if rhs != nil {
 			p.advance()
-			rhs := p.nextExpr(0)
-			if rhs != nil {
-				p.advance()
-			}
-			if p.currTok.tt != suffixClosedOps[opTok.tt] {
-				panic("improperly closed")
-			}
-			return Infix{lhs, opTok.tt, rhs}
 		}
+		if p.currTok.tt != v {
+			panic("improperly closed")
+		}
+		return Infix{PositionVector{lhs.start(), p.currTok.pos.end}, lhs, opTok, rhs}
 	}
-	for k, _ := range suffixUnclosedOps {
-		if opTok.tt == k {
-			return Suffix{lhs, opTok.tt}
-		}
+	if _, ok := suffixUnclosedOps[opTok.tt]; ok {
+		return Suffix{lhs, opTok}
 	}
 	return nil
 }
@@ -563,17 +696,19 @@ func (p *Parser) nextSuffix(lhs Expr, opTok Token) Expr {
 func (p *Parser) nextLit() Expr {
 	switch p.currTok.tt {
 	case TT_STRING:
-		return String{}
+		return String{p.currTok}
+	case TT_BYTE:
+		return Character{p.currTok}
 	case TT_INT:
-		return Int{}
+		return Integer{p.currTok}
 	case TT_FLOAT:
-		return Float{}
+		return Float{p.currTok}
 	case TT_IDENT:
-		return Ident{}
+		return Identifier{p.currTok}
 	case TT_LBRACE:
-		return p.nextBlock()
+		return p.NextBlock()
 	case TT_INVALID:
-		return Err{}
+		return Err{p.currTok}
 	default:
 		return nil
 	}
@@ -589,8 +724,7 @@ func (p *Parser) nextToken() Token {
 		if p.pos >= len(p.src) {
 			break
 		}
-		char := p.src[p.pos]
-		switch char {
+		switch p.currChar() {
 		case '\t', ' ', '\b':
 			p.pos++
 			continue
@@ -601,7 +735,7 @@ func (p *Parser) nextToken() Token {
 			continue
 		case '\r':
 			p.pos++
-			if p.peekChar() == '\n' {
+			if p.currChar() == '\n' {
 				p.pos++
 			}
 			p.col = 1
@@ -609,11 +743,13 @@ func (p *Parser) nextToken() Token {
 			continue
 		case '"':
 			return p.nextString()
+		case '\'':
+			return p.nextByte()
 		}
 		switch {
-		case char == '_' || (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z'):
+		case p.currChar() == '_' || (p.currChar() >= 'a' && p.currChar() <= 'z') || (p.currChar() >= 'A' && p.currChar() <= 'Z'):
 			return p.nextIdent()
-		case char == '.' || (char >= '0' && char <= '9'):
+		case (p.currChar() == '.' && p.peekChar() >= '0' && p.peekChar() <= '9') || (p.currChar() >= '0' && p.currChar() <= '9'):
 			return p.nextNumber()
 		default:
 			return p.nextOp()
@@ -629,6 +765,10 @@ func (p *Parser) peekChar() uint8 {
 		return p.src[p.pos+1]
 	}
 	return 0
+}
+
+func (p *Parser) currChar() uint8 {
+	return p.src[p.pos]
 }
 
 func (p *Parser) nextString() Token {
@@ -652,17 +792,29 @@ func (p *Parser) nextString() Token {
 		tt = TT_STRING
 	}
 	return Token{
-		tt:    tt,
-		start: start,
-		end:   p.pos,
+		tt,
+		PositionVector{start, p.pos},
 	}
+}
+
+func (p *Parser) nextByte() Token {
+	start := p.pos
+	tt := TT_INVALID
+	if p.peekChar() != '\'' {
+		tt = TT_BYTE
+	}
+	p.pos++
+	if p.peekChar() != '\'' {
+		tt = TT_INVALID
+	}
+	p.pos += 2
+	return Token{tt, PositionVector{start, p.pos}}
 }
 
 func (p *Parser) nextIdent() Token {
 	start := p.pos
 	for {
-		v := p.peekChar()
-		if v == '_' || (v >= 'a' && v <= 'z') || (v >= '0' && v <= '9') {
+		if v := p.peekChar(); v == '_' || (v >= 'a' && v <= 'z') || (v >= 'A' && v <= 'Z') || (v >= '0' && v <= '9') {
 			p.pos++
 		} else {
 			break
@@ -670,15 +822,14 @@ func (p *Parser) nextIdent() Token {
 	}
 	p.pos++ // ending
 	var tt TokenType
-	if tokenType, ok := keywords[p.src[start:p.pos]]; ok {
-		tt = tokenType
+	if tty, ok := keywords[p.src[start:p.pos]]; ok {
+		tt = tty
 	} else {
 		tt = TT_IDENT
 	}
 	return Token{
-		tt:    tt,
-		start: start,
-		end:   p.pos,
+		tt,
+		PositionVector{start, p.pos},
 	}
 }
 
@@ -694,25 +845,23 @@ func (p *Parser) nextNumber() Token {
 	float := false
 	invalid := false
 	for {
-		char := p.peekChar()
-		if char == 0 {
-			break
-		}
 		switch {
-		case char == '.':
+		case p.peekChar() == 0:
+			goto end
+		case p.peekChar() == '.':
 			if float {
 				invalid = true
 			} else {
 				float = true
 			}
 			p.pos++
-		case radix == 'd' && char >= '0' && char <= '9':
+		case radix == 'd' && p.peekChar() >= '0' && p.peekChar() <= '9':
 			p.pos++
-		case radix == 'b' && char >= '0' && char <= '1':
+		case radix == 'b' && p.peekChar() >= '0' && p.peekChar() <= '1':
 			p.pos++
-		case radix == 'o' && char >= '0' && char <= '7':
+		case radix == 'o' && p.peekChar() >= '0' && p.peekChar() <= '7':
 			p.pos++
-		case radix == 'x' && (char >= '0' && char <= '9' || char >= 'a' && char <= 'f' || char >= 'A' && char <= 'F'):
+		case radix == 'x' && (p.peekChar() >= '0' && p.peekChar() <= '9' || p.peekChar() >= 'a' && p.peekChar() <= 'f' || p.peekChar() >= 'A' && p.peekChar() <= 'F'):
 			p.pos++
 		default:
 			goto end
@@ -730,9 +879,8 @@ end:
 	}
 	p.pos++
 	return Token{
-		tt:    tt,
-		start: start,
-		end:   p.pos,
+		tt,
+		PositionVector{start, p.pos},
 	}
 }
 
@@ -744,12 +892,12 @@ func (p *Parser) nextOp() Token {
 		if p.pos >= len(p.src) {
 			break
 		}
-		// 1 = longest len(op) - 1
-		if len(stack) > 1 {
+		// 2: max op len
+		if len(stack) > 2-1 {
 			break
 		}
 		char := p.src[p.pos]
-		stack = fmt.Sprintf("%s%c", stack, char)
+		stack += string(char)
 		found := false
 		for k, v := range ops {
 			if strings.HasPrefix(k, stack) {
@@ -764,8 +912,7 @@ func (p *Parser) nextOp() Token {
 		p.pos++
 	}
 	return Token{
-		tt:    tt,
-		start: start,
-		end:   p.pos,
+		tt,
+		PositionVector{start, p.pos},
 	}
 }
