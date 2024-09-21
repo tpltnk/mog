@@ -11,11 +11,25 @@ import (
 //go:generate stringer -type=TokenType
 type TokenType int
 
-func (tt TokenType) isExprStart() bool {
-	_, okPrefix := prefixOps[tt]
-	_, okLits := lits[tt]
-	_, okGroup := groupOps[tt]
-	return okPrefix || okLits || okGroup
+func (tt TokenType) isExprStart(ruleset *Ruleset) bool {
+	_, isPrefix := ruleset.prefixOps[tt]
+	_, isLiteral := ruleset.literals[tt]
+	_, isGroup := ruleset.groupOps[tt]
+	return isPrefix || isLiteral || isGroup
+}
+
+type Ruleset struct {
+	keywords          map[string]TokenType
+	ops               map[string][]TokenType
+	prefixOps         map[TokenType]bool
+	groupOps          map[TokenType]TokenType
+	suffixUnclosedOps map[TokenType]bool
+	suffixClosedOps   map[TokenType]TokenType
+	prefixBindPowers  map[TokenType]int
+	suffixBindPowers  map[TokenType]int
+	leftBindPowers    map[TokenType]int
+	rightBindPowers   map[TokenType]int
+	literals          map[TokenType]func(p *Parser) Expr
 }
 
 const (
@@ -90,133 +104,165 @@ const (
 )
 
 var (
-	keywords = map[string]TokenType{
-		"fun":      TT_KW_FUN,
-		"for":      TT_KW_FOR,
-		"if":       TT_KW_IF,
-		"else":     TT_KW_ELSE,
-		"yield":    TT_KW_YIELD,
-		"return":   TT_KW_RETURN,
-		"break":    TT_KW_BREAK,
-		"continue": TT_KW_CONTINUE,
-		"import":   TT_KW_IMPORT,
-		"in":       TT_KW_IN,
-		"class":    TT_KW_CLASS,
-		"assert":   TT_KW_ASSERT,
-		"machine":  TT_KW_MACHINE,
+	normalRuleset = Ruleset{
+		keywords: map[string]TokenType{
+			"fun":      TT_KW_FUN,
+			"for":      TT_KW_FOR,
+			"if":       TT_KW_IF,
+			"else":     TT_KW_ELSE,
+			"yield":    TT_KW_YIELD,
+			"return":   TT_KW_RETURN,
+			"break":    TT_KW_BREAK,
+			"continue": TT_KW_CONTINUE,
+			"import":   TT_KW_IMPORT,
+			"in":       TT_KW_IN,
+			"class":    TT_KW_CLASS,
+			"assert":   TT_KW_ASSERT,
+			"machine":  TT_KW_MACHINE,
+		},
+		ops: map[string][]TokenType{
+			"+":  {TT_PLUS},
+			"-":  {TT_MINUS},
+			"*":  {TT_STAR},
+			"/":  {TT_SLASH},
+			"%":  {TT_PERCENT},
+			",":  {TT_COMMA},
+			"..": {TT_DOT, TT_RANGE},
+			":":  {TT_COLON},
+			"#":  {TT_HASH},
+			"~":  {TT_BIT_NOT},
+			"<=": {TT_LT, TT_LTE},
+			">=": {TT_GT, TT_GTE},
+			"==": {TT_IS, TT_EQ},
+			"?":  {TT_QMARK},
+			"!=": {TT_EMARK, TT_NEQ},
+			"&&": {TT_BIT_AND, TT_AND},
+			"||": {TT_BIT_OR, TT_OR},
+			"[":  {TT_LBRACK},
+			"]":  {TT_RBRACK},
+			"{":  {TT_LBRACE},
+			"}":  {TT_RBRACE},
+			"(":  {TT_LPAREN},
+			")":  {TT_RPAREN},
+		},
+		prefixOps: map[TokenType]bool{
+			TT_MINUS:   true,
+			TT_BIT_NOT: true,
+			TT_EMARK:   true,
+			TT_STAR:    true,
+			TT_COLON:   true,
+		},
+		groupOps: map[TokenType]TokenType{
+			TT_LPAREN: TT_RPAREN,
+		},
+		suffixUnclosedOps: map[TokenType]bool{
+			TT_EMARK: true,
+			TT_QMARK: true,
+			TT_COLON: true,
+		},
+		suffixClosedOps: map[TokenType]TokenType{
+			TT_LBRACK: TT_RBRACK,
+			TT_LPAREN: TT_RPAREN,
+		},
+		prefixBindPowers: map[TokenType]int{
+			TT_PLUS:    31,
+			TT_MINUS:   31,
+			TT_BIT_NOT: 31,
+			TT_EMARK:   31,
+			TT_STAR:    31,
+			TT_COLON:   31,
+		},
+		suffixBindPowers: map[TokenType]int{
+			TT_EMARK:  32,
+			TT_QMARK:  32,
+			TT_LBRACK: 32,
+			TT_LPAREN: 32,
+			TT_COLON:  32,
+		},
+		rightBindPowers: map[TokenType]int{
+			TT_IS:      3,
+			TT_COMMA:   5,
+			TT_OR:      7,
+			TT_AND:     9,
+			TT_BIT_OR:  11,
+			TT_BIT_AND: 13,
+			TT_NEQ:     15,
+			TT_EQ:      15,
+			TT_GT:      17,
+			TT_LT:      17,
+			TT_GTE:     17,
+			TT_LTE:     17,
+			TT_BIT_LSH: 19,
+			TT_BIT_RSH: 19,
+			TT_MINUS:   21,
+			TT_PLUS:    21,
+			TT_SLASH:   23,
+			TT_STAR:    23,
+			TT_RANGE:   25,
+			TT_DOT:     27,
+			TT_COLON:   29,
+		},
+		leftBindPowers: map[TokenType]int{
+			TT_IS:      4,
+			TT_COMMA:   6,
+			TT_OR:      8,
+			TT_AND:     10,
+			TT_BIT_OR:  12,
+			TT_BIT_AND: 14,
+			TT_NEQ:     16,
+			TT_EQ:      16,
+			TT_GT:      18,
+			TT_LT:      18,
+			TT_GTE:     18,
+			TT_LTE:     18,
+			TT_BIT_LSH: 20,
+			TT_BIT_RSH: 20,
+			TT_MINUS:   22,
+			TT_PLUS:    22,
+			TT_SLASH:   24,
+			TT_STAR:    24,
+			TT_RANGE:   26,
+			TT_DOT:     28,
+			TT_COLON:   30,
+		},
+		literals: map[TokenType]func(p *Parser) Expr{
+			TT_STRING: func(p *Parser) Expr { return String{p.currTok} },
+			TT_INT:    func(p *Parser) Expr { return Integer{p.currTok} },
+			TT_BYTE:   func(p *Parser) Expr { return Character{p.currTok} },
+			TT_LBRACE: func(p *Parser) Expr { return p.NextBlock() }, // aka block
+			TT_IDENT:  func(p *Parser) Expr { return Identifier{p.currTok} },
+			TT_FLOAT:  func(p *Parser) Expr { return Float{p.currTok} },
+		},
 	}
-	ops = map[string][]TokenType{
-		"+":  {TT_PLUS},
-		"-":  {TT_MINUS},
-		"*":  {TT_STAR},
-		"/":  {TT_SLASH},
-		"%":  {TT_PERCENT},
-		",":  {TT_COMMA},
-		"..": {TT_DOT, TT_RANGE},
-		":":  {TT_COLON},
-		"#":  {TT_HASH},
-		"~":  {TT_BIT_NOT},
-		"<=": {TT_LT, TT_LTE},
-		">=": {TT_GT, TT_GTE},
-		"==": {TT_IS, TT_EQ},
-		"?":  {TT_QMARK},
-		"!=": {TT_EMARK, TT_NEQ},
-		"&&": {TT_BIT_AND, TT_AND},
-		"||": {TT_BIT_OR, TT_OR},
-		"[":  {TT_LBRACK},
-		"]":  {TT_RBRACK},
-		"{":  {TT_LBRACE},
-		"}":  {TT_RBRACE},
-		"(":  {TT_LPAREN},
-		")":  {TT_RPAREN},
-	}
-	prefixOps = map[TokenType]bool{
-		TT_MINUS:   true,
-		TT_BIT_NOT: true,
-		TT_EMARK:   true,
-		TT_STAR:    true,
-		TT_COLON:   true,
-	}
-	groupOps = map[TokenType]TokenType{
-		TT_LPAREN: TT_RPAREN,
-	}
-	suffixUnclosedOps = map[TokenType]bool{
-		TT_EMARK: true,
-		TT_QMARK: true,
-		TT_COLON: true,
-	}
-	suffixClosedOps = map[TokenType]TokenType{
-		TT_LBRACK: TT_RBRACK,
-		TT_LPAREN: TT_RPAREN,
-	}
-	prefixBindPowers = map[TokenType]int{
-		TT_PLUS:    31,
-		TT_MINUS:   31,
-		TT_BIT_NOT: 31,
-		TT_EMARK:   31,
-		TT_STAR:    31,
-		TT_COLON:   31,
-	}
-	suffixBindPowers = map[TokenType]int{
-		TT_EMARK:  32,
-		TT_QMARK:  32,
-		TT_LBRACK: 32,
-		TT_LPAREN: 32,
-		TT_COLON:  32,
-	}
-	rightBindPowers = map[TokenType]int{
-		TT_IS:      3,
-		TT_COMMA:   5,
-		TT_OR:      7,
-		TT_AND:     9,
-		TT_BIT_OR:  11,
-		TT_BIT_AND: 13,
-		TT_NEQ:     15,
-		TT_EQ:      15,
-		TT_GT:      17,
-		TT_LT:      17,
-		TT_GTE:     17,
-		TT_LTE:     17,
-		TT_BIT_LSH: 19,
-		TT_BIT_RSH: 19,
-		TT_MINUS:   21,
-		TT_PLUS:    21,
-		TT_SLASH:   23,
-		TT_STAR:    23,
-		TT_RANGE:   25,
-		TT_DOT:     27,
-		TT_COLON:   29,
-	}
-	leftBindPowers = map[TokenType]int{
-		TT_IS:      4,
-		TT_COMMA:   6,
-		TT_OR:      8,
-		TT_AND:     10,
-		TT_BIT_OR:  12,
-		TT_BIT_AND: 14,
-		TT_NEQ:     16,
-		TT_EQ:      16,
-		TT_GT:      18,
-		TT_LT:      18,
-		TT_GTE:     18,
-		TT_LTE:     18,
-		TT_BIT_LSH: 20,
-		TT_BIT_RSH: 20,
-		TT_MINUS:   22,
-		TT_PLUS:    22,
-		TT_SLASH:   24,
-		TT_STAR:    24,
-		TT_RANGE:   26,
-		TT_DOT:     28,
-		TT_COLON:   30,
-	}
-	lits = map[TokenType]bool{
-		TT_STRING: true,
-		TT_INT:    true,
-		TT_BYTE:   true,
-		TT_LBRACE: true, // aka block
-		TT_IDENT:  true,
-		TT_FLOAT:  true,
+
+	typeRuleset = Ruleset{
+		ops: map[string][]TokenType{
+			"+": {TT_PLUS},
+			",": {TT_COMMA},
+			"!": {TT_EMARK},
+			"(": {TT_LPAREN},
+			")": {TT_RPAREN},
+		},
+		prefixOps: map[TokenType]bool{
+			TT_EMARK: true,
+		},
+		groupOps: map[TokenType]TokenType{
+			TT_LPAREN: TT_RPAREN,
+		},
+		prefixBindPowers: map[TokenType]int{
+			TT_EMARK: 31,
+		},
+		rightBindPowers: map[TokenType]int{
+			TT_COMMA: 3,
+			TT_PLUS:  5,
+		},
+		leftBindPowers: map[TokenType]int{
+			TT_COMMA: 4,
+			TT_PLUS:  6,
+		},
+		literals: map[TokenType]func(p *Parser) Expr{
+			TT_IDENT: func(p *Parser) Expr { return Identifier{p.currTok} },
+		},
 	}
 )
 
@@ -244,6 +290,9 @@ func (sm *SourceManager) AddSource(srcName string, src string) error {
 }
 
 func (sm *SourceManager) AddFile(path string) error {
+	if filepath.Ext(path) != ".mog" {
+		return errors.New("invalid extension")
+	}
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -276,27 +325,43 @@ func (sm *SourceManager) ParseSources() map[string]*Block {
 type Parser struct {
 	src string
 
-	pos  int
+	abs  int
 	col  int
 	line int
 
 	currTok Token
 	nextTok Token
 
-	currBlk  *Block
-	blkDepth int
+	currentBlock *Block
+	blockDepth   int
+
+	rulesetStack []*Ruleset
 }
 
 func NewParser(src string) Parser {
 	p := Parser{
-		src:      src,
-		pos:      0,
-		col:      1,
-		line:     1,
-		blkDepth: 0,
+		src:          src,
+		abs:          0,
+		col:          1,
+		line:         1,
+		blockDepth:   0,
+		rulesetStack: []*Ruleset{},
 	}
+	p.pushRuleset(&normalRuleset)
 	p.advance()
 	return p
+}
+
+func (p *Parser) currRuleset() *Ruleset {
+	return p.rulesetStack[len(p.rulesetStack)-1]
+}
+
+func (p *Parser) pushRuleset(ruleset *Ruleset) {
+	p.rulesetStack = append(p.rulesetStack, ruleset)
+}
+
+func (p *Parser) popRuleset() {
+	p.rulesetStack = p.rulesetStack[:len(p.rulesetStack)-1]
 }
 
 func (p *Parser) NextRoot() *Block {
@@ -308,28 +373,28 @@ func (p *Parser) NextRoot() *Block {
 }
 
 func (p *Parser) NextBlock() *Block {
-	p.blkDepth++
-	if p.blkDepth > 32 {
+	p.blockDepth++
+	if p.blockDepth > 32 {
 		panic("max block depth exceeded")
 	}
-	p.currBlk = &Block{
+	p.currentBlock = &Block{
 		pos: PositionVector{
 			start: p.currTok.pos.start,
 		},
 		stmts:  make([]Statement, 0),
-		parent: p.currBlk,
+		parent: p.currentBlock,
 	}
 	for {
 		stmt := p.nextStatement()
 		if stmt == nil {
 			break
 		}
-		p.currBlk.stmts = append(p.currBlk.stmts, stmt)
+		p.currentBlock.stmts = append(p.currentBlock.stmts, stmt)
 	}
-	p.currBlk.pos.end = p.currTok.pos.end
-	blk := p.currBlk
-	p.currBlk = p.currBlk.parent
-	p.blkDepth--
+	p.currentBlock.pos.end = p.currTok.pos.end
+	blk := p.currentBlock
+	p.currentBlock = p.currentBlock.parent
+	p.blockDepth--
 	return blk
 }
 
@@ -340,6 +405,8 @@ func (p *Parser) nextStatement() Statement {
 	}
 	switch p.currTok.tt {
 	case TT_RBRACE:
+		return nil
+	case TT_EOF:
 		return nil
 	case TT_KW_RETURN:
 		return p.nextReturn()
@@ -361,8 +428,6 @@ func (p *Parser) nextStatement() Statement {
 		return p.nextFunction()
 	case TT_KW_CLASS:
 		return p.nextClass()
-	case TT_EOF:
-		return nil
 	default:
 		return p.nextExpr(0)
 	}
@@ -371,7 +436,7 @@ func (p *Parser) nextStatement() Statement {
 func (p *Parser) nextReturn() Statement {
 	start := p.currTok.pos.start
 	end := p.currTok.pos.end
-	if p.nextTok.tt.isExprStart() {
+	if p.nextTok.tt.isExprStart(p.currRuleset()) {
 		p.advance()
 	}
 	rhs := p.nextExpr(0)
@@ -384,7 +449,7 @@ func (p *Parser) nextReturn() Statement {
 func (p *Parser) nextBreak() Statement {
 	start := p.currTok.pos.start
 	end := p.currTok.pos.end
-	if p.nextTok.tt.isExprStart() {
+	if p.nextTok.tt.isExprStart(p.currRuleset()) {
 		p.advance()
 	}
 	rhs := p.nextExpr(0)
@@ -403,7 +468,7 @@ func (p *Parser) nextContinue() Statement {
 func (p *Parser) nextYield() Statement {
 	start := p.currTok.pos.start
 	end := p.currTok.pos.end
-	if p.nextTok.tt.isExprStart() {
+	if p.nextTok.tt.isExprStart(p.currRuleset()) {
 		p.advance()
 	}
 	rhs := p.nextExpr(0)
@@ -458,11 +523,11 @@ func (p *Parser) nextClass() Class {
 		}
 	}
 out:
-	return Class{PositionVector{start, p.pos}, name, params}
+	return Class{PositionVector{start, p.abs}, name, params}
 }
 
 func (p *Parser) nextIf() Statement {
-	start := p.pos
+	start := p.abs
 	p.advance()
 	cond := p.nextExpr(0)
 	if cond == nil {
@@ -476,7 +541,7 @@ func (p *Parser) nextIf() Statement {
 		p.advance() // {
 		alt = p.NextBlock()
 	}
-	return If{PositionVector{start, p.pos}, cond, main, alt}
+	return If{PositionVector{start, p.abs}, cond, main, alt}
 }
 
 func (p *Parser) nextFor() Statement {
@@ -508,7 +573,7 @@ func (p *Parser) nextFunction() Function {
 	sig := p.nextSignature()
 	p.advance()
 	body := p.NextBlock()
-	return Function{PositionVector{start, p.pos}, sig, body}
+	return Function{PositionVector{start, p.abs}, sig, body}
 }
 
 func (p *Parser) nextSignature() Signature {
@@ -577,27 +642,14 @@ func (p *Parser) nextParameter() Parameter {
 	return Parameter{*spec, dfl}
 }
 
-// TODO: "Lift" (provide a different set of ops) for parsing complicated Type (by LL(1) Pratt logic)
-// TODO: probably with a stack: stack.push(new_ops) and parse according to stack[last] then stack.pop() on signal/ctx_switch message
-// Consideration: How much semantics is good in Type(s)?
 func (p *Parser) nextType() Type {
-	switch p.currTok.tt {
-	case TT_IDENT:
-		return IdentType{p.currTok}
-	case TT_STAR:
-		start := p.pos
-		p.advance()
-		inner := p.nextType()
-		return PointerType{
-			PositionVector{
-				start,
-				inner.end(),
-			},
-			inner,
-		}
-	default:
-		return nil
+	p.pushRuleset(&typeRuleset)
+	ty := p.nextExpr(0)
+	if _, isErr := ty.(Err); isErr {
+		panic("type invalid")
 	}
+	p.popRuleset()
+	return ty
 }
 
 func (p *Parser) nextSpecification() *Specification {
@@ -624,7 +676,7 @@ func (p *Parser) nextExpr(minBindPower int) Expr {
 		if p.nextTok.tt == TT_EOF {
 			break
 		}
-		if leftBindPower, ok := suffixBindPowers[p.nextTok.tt]; ok {
+		if leftBindPower, ok := p.currRuleset().suffixBindPowers[p.nextTok.tt]; ok {
 			if leftBindPower < minBindPower {
 				break
 			}
@@ -632,12 +684,16 @@ func (p *Parser) nextExpr(minBindPower int) Expr {
 			lhs = p.nextSuffix(lhs, p.currTok)
 			continue
 		}
-		if leftBindPower, ok := leftBindPowers[p.nextTok.tt]; ok {
-			if rightBindPower, ok := rightBindPowers[p.nextTok.tt]; ok {
+		if leftBindPower, ok := p.currRuleset().leftBindPowers[p.nextTok.tt]; ok {
+			if rightBindPower, ok := p.currRuleset().rightBindPowers[p.nextTok.tt]; ok {
 				if leftBindPower < minBindPower {
 					break
 				}
 				p.advance()
+				if p.nextTok.tt == TT_INVALID {
+					lhs = Err{p.nextTok}
+					break
+				}
 				lhs = p.nextInfix(lhs, rightBindPower, p.currTok)
 				continue
 			}
@@ -649,18 +705,23 @@ func (p *Parser) nextExpr(minBindPower int) Expr {
 }
 
 func (p *Parser) nextPrefix() Expr {
-	if _, ok := prefixOps[p.currTok.tt]; ok {
-		currTok := p.currTok
-		rightBindPower := prefixBindPowers[p.currTok.tt]
+	prevTok := p.currTok
+	if _, ok := p.currRuleset().prefixOps[p.currTok.tt]; ok {
+		rightBindPower := p.currRuleset().prefixBindPowers[p.currTok.tt]
 		p.advance()
 		rhs := p.nextExpr(rightBindPower)
-		return Prefix{currTok, rhs}
+		return Prefix{prevTok, rhs}
 	}
-	if _, ok := groupOps[p.currTok.tt]; ok {
+	if _, ok := p.currRuleset().groupOps[p.currTok.tt]; ok {
 		p.advance()
 		inner := p.nextExpr(0)
 		if inner == nil {
-			inner = Unit{}
+			inner = Unit{
+				PositionVector{
+					prevTok.pos.start,
+					p.currTok.pos.end,
+				},
+			}
 		} else {
 			p.advance()
 		}
@@ -676,7 +737,7 @@ func (p *Parser) nextInfix(lhs Expr, rightBindPower int, opTok Token) Infix {
 }
 
 func (p *Parser) nextSuffix(lhs Expr, opTok Token) Expr {
-	if v, ok := suffixClosedOps[opTok.tt]; ok {
+	if v, ok := p.currRuleset().suffixClosedOps[opTok.tt]; ok {
 		p.advance()
 		rhs := p.nextExpr(0)
 		if rhs != nil {
@@ -687,31 +748,21 @@ func (p *Parser) nextSuffix(lhs Expr, opTok Token) Expr {
 		}
 		return Infix{PositionVector{lhs.start(), p.currTok.pos.end}, lhs, opTok, rhs}
 	}
-	if _, ok := suffixUnclosedOps[opTok.tt]; ok {
+	if _, ok := p.currRuleset().suffixUnclosedOps[opTok.tt]; ok {
 		return Suffix{lhs, opTok}
 	}
 	return nil
 }
 
 func (p *Parser) nextLit() Expr {
-	switch p.currTok.tt {
-	case TT_STRING:
-		return String{p.currTok}
-	case TT_BYTE:
-		return Character{p.currTok}
-	case TT_INT:
-		return Integer{p.currTok}
-	case TT_FLOAT:
-		return Float{p.currTok}
-	case TT_IDENT:
-		return Identifier{p.currTok}
-	case TT_LBRACE:
-		return p.NextBlock()
-	case TT_INVALID:
-		return Err{p.currTok}
-	default:
+	litFunc, ok := p.currRuleset().literals[p.currTok.tt]
+	if !ok {
 		return nil
 	}
+	if p.currTok.tt == TT_INVALID {
+		return Err{p.currTok}
+	}
+	return litFunc(p)
 }
 
 func (p *Parser) advance() {
@@ -721,22 +772,22 @@ func (p *Parser) advance() {
 
 func (p *Parser) nextToken() Token {
 	for {
-		if p.pos >= len(p.src) {
+		if p.abs >= len(p.src) {
 			break
 		}
 		switch p.currChar() {
 		case '\t', ' ', '\b':
-			p.pos++
+			p.abs++
 			continue
 		case '\n':
-			p.pos++
+			p.abs++
 			p.col = 1
 			p.line++
 			continue
 		case '\r':
-			p.pos++
+			p.abs++
 			if p.currChar() == '\n' {
-				p.pos++
+				p.abs++
 			}
 			p.col = 1
 			p.line++
@@ -761,84 +812,84 @@ func (p *Parser) nextToken() Token {
 }
 
 func (p *Parser) peekChar() uint8 {
-	if p.pos+1 < len(p.src) {
-		return p.src[p.pos+1]
+	if p.abs+1 < len(p.src) {
+		return p.src[p.abs+1]
 	}
 	return 0
 }
 
 func (p *Parser) currChar() uint8 {
-	return p.src[p.pos]
+	return p.src[p.abs]
 }
 
 func (p *Parser) nextString() Token {
-	start := p.pos
-	p.pos++ // skip initial "
+	start := p.abs
+	p.abs++ // skip initial "
 	for {
 		v := p.peekChar()
 		if v != 0 && v != '"' {
-			p.pos++
+			p.abs++
 		} else {
 			break
 		}
 	}
 	var tt TokenType
 	if p.peekChar() == 0 {
-		p.pos++
+		p.abs++
 		tt = TT_INVALID
 	} else {
-		p.pos += 2
-		// p.pos += 2 // consume current and "
+		p.abs += 2
+		// p.abs += 2 // consume current and "
 		tt = TT_STRING
 	}
 	return Token{
 		tt,
-		PositionVector{start, p.pos},
+		PositionVector{start, p.abs},
 	}
 }
 
 func (p *Parser) nextByte() Token {
-	start := p.pos
+	start := p.abs
 	tt := TT_INVALID
 	if p.peekChar() != '\'' {
 		tt = TT_BYTE
 	}
-	p.pos++
+	p.abs++
 	if p.peekChar() != '\'' {
 		tt = TT_INVALID
 	}
-	p.pos += 2
-	return Token{tt, PositionVector{start, p.pos}}
+	p.abs += 2
+	return Token{tt, PositionVector{start, p.abs}}
 }
 
 func (p *Parser) nextIdent() Token {
-	start := p.pos
+	start := p.abs
 	for {
 		if v := p.peekChar(); v == '_' || (v >= 'a' && v <= 'z') || (v >= 'A' && v <= 'Z') || (v >= '0' && v <= '9') {
-			p.pos++
+			p.abs++
 		} else {
 			break
 		}
 	}
-	p.pos++ // ending
+	p.abs++ // ending
 	var tt TokenType
-	if tty, ok := keywords[p.src[start:p.pos]]; ok {
+	if tty, ok := p.currRuleset().keywords[p.src[start:p.abs]]; ok {
 		tt = tty
 	} else {
 		tt = TT_IDENT
 	}
 	return Token{
 		tt,
-		PositionVector{start, p.pos},
+		PositionVector{start, p.abs},
 	}
 }
 
 func (p *Parser) nextNumber() Token {
-	start := p.pos
+	start := p.abs
 	var radix uint8 = 'd'
-	if p.src[p.pos] == '0' {
+	if p.src[p.abs] == '0' {
 		if r := p.peekChar(); r == 'b' || r == 'o' || r == 'x' {
-			p.pos++
+			p.abs++
 			radix = r
 		}
 	}
@@ -854,15 +905,15 @@ func (p *Parser) nextNumber() Token {
 			} else {
 				float = true
 			}
-			p.pos++
+			p.abs++
 		case radix == 'd' && p.peekChar() >= '0' && p.peekChar() <= '9':
-			p.pos++
+			p.abs++
 		case radix == 'b' && p.peekChar() >= '0' && p.peekChar() <= '1':
-			p.pos++
+			p.abs++
 		case radix == 'o' && p.peekChar() >= '0' && p.peekChar() <= '7':
-			p.pos++
+			p.abs++
 		case radix == 'x' && (p.peekChar() >= '0' && p.peekChar() <= '9' || p.peekChar() >= 'a' && p.peekChar() <= 'f' || p.peekChar() >= 'A' && p.peekChar() <= 'F'):
-			p.pos++
+			p.abs++
 		default:
 			goto end
 		}
@@ -877,29 +928,29 @@ end:
 	default:
 		tt = TT_INT
 	}
-	p.pos++
+	p.abs++
 	return Token{
 		tt,
-		PositionVector{start, p.pos},
+		PositionVector{start, p.abs},
 	}
 }
 
 func (p *Parser) nextOp() Token {
-	start := p.pos
+	start := p.abs
 	tt := TT_INVALID
 	stack := ""
 	for {
-		if p.pos >= len(p.src) {
+		if p.abs >= len(p.src) {
 			break
 		}
 		// 2: max op len
 		if len(stack) > 2-1 {
 			break
 		}
-		char := p.src[p.pos]
+		char := p.src[p.abs]
 		stack += string(char)
 		found := false
-		for k, v := range ops {
+		for k, v := range p.currRuleset().ops {
 			if strings.HasPrefix(k, stack) {
 				tt = v[len(stack)-1]
 				found = true
@@ -909,10 +960,10 @@ func (p *Parser) nextOp() Token {
 		if !found {
 			break
 		}
-		p.pos++
+		p.abs++
 	}
 	return Token{
 		tt,
-		PositionVector{start, p.pos},
+		PositionVector{start, p.abs},
 	}
 }

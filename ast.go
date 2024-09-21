@@ -139,14 +139,15 @@ func (s Suffix) end() int {
 }
 
 type Unit struct {
+	pos PositionVector
 }
 
 func (n Unit) start() int {
-	return 0
+	return n.pos.start
 }
 
 func (n Unit) end() int {
-	return 0
+	return n.pos.end
 }
 
 type String struct {
@@ -383,27 +384,4 @@ func (s Specification) end() int {
 
 type Type interface {
 	Position
-}
-
-type IdentType Identifier
-
-func (t IdentType) start() int {
-	return t.Token.pos.start
-}
-
-func (t IdentType) end() int {
-	return t.Token.pos.end
-}
-
-type PointerType struct {
-	pos     PositionVector
-	pointed Type
-}
-
-func (p PointerType) start() int {
-	return p.pos.start
-}
-
-func (p PointerType) end() int {
-	return p.pos.end
 }

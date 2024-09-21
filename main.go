@@ -8,9 +8,9 @@ import (
 func main() {
 	start := time.Now()
 	s :=
-		`fun main(): int { 
+		`fun main(): (int, int) { 
     		for x: y in iter {
-				print(x, y, 10)
+				print(x, y, 10, ())
 				do_err!??
 				break
 				continue
